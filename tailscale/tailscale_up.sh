@@ -18,7 +18,21 @@ fi
 # for its own rules. Requires sys_module cap + /lib/modules bind-mount.
 modprobe ip6table_filter ip6table_nat 2>/dev/null || true
 
-tailscaled &
+# Fixed WireGuard/magicsock listening port, published through docker (see
+# the "ports:" entry for this service in docker-compose.yml) so peers can
+# actually open a direct UDP connection to this node. Without a published,
+# predictable port, tailscaled's randomized-port default (this tailnet's
+# control server pushes a "randomize-client-port" policy to every node)
+# means the port is both unpredictable AND, more importantly, was never
+# forwarded through docker's network isolation in the first place — so no
+# peer could ever reach this container directly, regardless of NAT
+# traversal succeeding. Every connection was structurally forced onto DERP
+# or peer-relay, even for peers on the same LAN as this host, where a
+# direct connection should otherwise be trivial. Pinning + publishing a
+# fixed port removes that structural barrier.
+TAILSCALE_PORT=${TAILSCALE_PORT:-41641}
+
+tailscaled --port "$TAILSCALE_PORT" &
 
 # Wait for the daemon's localapi to actually answer before issuing CLI
 # commands. A fixed sleep race-loses on slow boots: `tailscale up` then
@@ -34,6 +48,22 @@ ps auxwwf
 
 ACTIVE_GW_FILE="/var/lib/tailscale/active_gateway"
 ACTIVE_GW_FILE_V6="/var/lib/tailscale/active_gateway_v6"
+DIRECT_GW_FILE="/var/lib/tailscale/direct_gateway"
+
+# Capture docker's own bridge-network gateway BEFORE we overwrite the
+# default route below. On any docker bridge network, dockerd assigns this
+# automatically (the first usable IP in the configured subnet) and routes
+# it to the real internet via the host's own NAT — completely independent
+# of whichever VPN backend container we're about to point the default
+# route at. We save it now because it's only visible as the *current*
+# default route this one time, before the VPN backend override below
+# replaces it; every later boot re-derives it fresh the same way, so this
+# doesn't depend on any hardcoded subnet or IP.
+CURRENT_DEFAULT_GW=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
+if [ -n "$CURRENT_DEFAULT_GW" ]; then
+  echo "$CURRENT_DEFAULT_GW" > "$DIRECT_GW_FILE"
+fi
+DIRECT_GW=$(cat "$DIRECT_GW_FILE" 2>/dev/null || echo "")
 
 # Restore saved gateway (falls back to NordVPN if no state saved yet).
 SAVED_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
@@ -66,6 +96,33 @@ UNHEALTHY_THRESHOLD=${UNHEALTHY_THRESHOLD:-3}
 # worst case, so keep this at roughly interval/2 or less).
 EGRESS_CHECK_URLS="${EGRESS_CHECK_URLS:-http://1.1.1.1/ http://www.gstatic.com/generate_204}"
 EGRESS_CHECK_TIMEOUT="${EGRESS_CHECK_TIMEOUT:-4}"
+
+# Split-tunnel tailscaled's own traffic away from the VPN backend. Without
+# this, tailscaled's connection to the coordination server and to DERP
+# relays shares a single egress path with every VPN backend hiccup —
+# meaning this node can go unreachable to the rest of the tailnet purely
+# because the VPN backend had a transient blip, even though nothing about
+# the exit-node function itself is actually broken. Splitting keeps that
+# liveness signal independent of the VPN backend's reliability. Traffic
+# FORWARDED from other tailnet peers (i.e. actual exit-node usage) is
+# unaffected either way — it still always goes through the VPN backend.
+# Set to "false" to keep tailscaled's own traffic behind the VPN backend
+# too (e.g. if hiding this node's own metadata traffic matters more to you
+# than resilience).
+SPLIT_CONTROL_TRAFFIC=${SPLIT_CONTROL_TRAFFIC:-true}
+# Routing table IDs and ip-rule priorities for the split. Defaults are
+# arbitrary but chosen to avoid colliding with tailscaled's own internal
+# policy routing (it uses table 52 and priorities 5210-5270 for its own
+# loop-avoidance fwmark rules — see setup_split_tunnel below).
+SPLIT_FWD_TABLE=${SPLIT_FWD_TABLE:-100}
+SPLIT_FWD_RULE_PRIORITY=${SPLIT_FWD_RULE_PRIORITY:-5100}
+SPLIT_DIRECT_TABLE=${SPLIT_DIRECT_TABLE:-200}
+SPLIT_DIRECT_RULE_PRIORITY=${SPLIT_DIRECT_RULE_PRIORITY:-32760}
+# fwmark for DNS-via-VPN-backend exception (see setup_split_tunnel). Low
+# value, well outside the 0xff0000 mask tailscaled's own fwmark rules
+# check, so the two can never collide even on the same packet.
+SPLIT_DNS_FWMARK=${SPLIT_DNS_FWMARK:-0x64}
+SPLIT_DNS_RULE_PRIORITY=${SPLIT_DNS_RULE_PRIORITY:-32750}
 
 do_tailscale_up() {
   # Always pass --auth-key when TAILSCALE_AUTH_KEY is set: tailscale uses it
@@ -129,7 +186,96 @@ has_egress() {
   return 1
 }
 
+sync_split_fwd_table() {
+  # Keep the forwarded-traffic table's gateway in sync with whichever VPN
+  # backend is currently active. This can change at runtime (the control
+  # panel lets you switch backends via gateway_api.py), and forwarded
+  # exit-node traffic must always follow that choice, exactly like the
+  # main default route does above.
+  [ "$SPLIT_CONTROL_TRAFFIC" = "true" ] || return 0
+  ACTIVE_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
+  ip route replace default via "$ACTIVE_GW" dev eth0 table "$SPLIT_FWD_TABLE" 2>/dev/null
+}
+
+setup_split_tunnel() {
+  # See SPLIT_CONTROL_TRAFFIC above for the why. Mechanically: tailscaled
+  # already does its own policy routing to avoid looping its own traffic
+  # back through its own tunnel (fwmark 0x80000, table 52 — visible via
+  # `ip rule show`). We piggyback on the same technique rather than
+  # inventing a new one:
+  #
+  #   - Traffic FORWARDED from other tailnet peers enters this box on the
+  #     tailscale0 interface before being routed onward. `ip rule ... iif
+  #     tailscale0` matches exactly that traffic and nothing else — it
+  #     never matches tailscaled's own locally-generated connections,
+  #     since those don't have an input interface. That traffic keeps
+  #     going through the VPN backend (table SPLIT_FWD_TABLE), unchanged
+  #     from today's behavior.
+  #   - Everything else (tailscaled's own sockets: the coordination-server
+  #     connection, DERP, log uploads, plus any other local process in
+  #     this container) falls through to table SPLIT_DIRECT_TABLE, which
+  #     routes via docker's own bridge gateway — bypassing the VPN backend
+  #     entirely.
+  #
+  # Both rules are inserted well before the pre-existing 32766/32767
+  # main/default fallback rules, and the forwarded-traffic rule is
+  # positioned before tailscaled's own fwmark rules (5210-5270) so it
+  # can't be shadowed by them.
+  [ "$SPLIT_CONTROL_TRAFFIC" = "true" ] || { echo "SPLIT_CONTROL_TRAFFIC=false; tailscaled traffic stays behind the VPN backend"; return 0; }
+  if [ -z "$DIRECT_GW" ]; then
+    echo "no direct gateway captured at startup; skipping split-tunnel setup"
+    return 0
+  fi
+
+  # tailscale0 doesn't exist until `tailscale up` has actually brought the
+  # interface up. Poll briefly rather than assuming it's already there.
+  i=0
+  while [ $i -lt 30 ]; do
+    ip link show tailscale0 >/dev/null 2>&1 && break
+    sleep 1
+    i=$((i + 1))
+  done
+  if ! ip link show tailscale0 >/dev/null 2>&1; then
+    echo "tailscale0 never appeared; skipping split-tunnel setup"
+    return 0
+  fi
+
+  sync_split_fwd_table
+  ip rule show | grep -q "^${SPLIT_FWD_RULE_PRIORITY}:" \
+    || ip rule add iif tailscale0 lookup "$SPLIT_FWD_TABLE" priority "$SPLIT_FWD_RULE_PRIORITY"
+
+  ip route replace default via "$DIRECT_GW" dev eth0 table "$SPLIT_DIRECT_TABLE"
+  ip rule show | grep -q "^${SPLIT_DIRECT_RULE_PRIORITY}:" \
+    || ip rule add from all lookup "$SPLIT_DIRECT_TABLE" priority "$SPLIT_DIRECT_RULE_PRIORITY"
+
+  # DNS exception: route DNS queries (port 53) via the VPN backend rather
+  # than direct. Some backends' resolvers (e.g. ProtonVPN's in-tunnel DNS)
+  # only exist inside the VPN tunnel's own private address space and are
+  # unreachable via the direct path. DNS is short-lived request/response
+  # traffic, not vulnerable to the long-held-connection reset problem this
+  # split exists to route around, so sending it via the VPN backend is
+  # safe and keeps in-tunnel-only resolvers working.
+  #
+  # Matched by destination port, not by resolver IP: this container's
+  # /etc/resolv.conf always points at Docker's own embedded DNS stub
+  # (127.0.0.11), which then forwards to the real upstream resolvers from
+  # inside this same container — but which IPs those are isn't reliably
+  # readable (it's only in a Docker-internal comment, an implementation
+  # detail we don't want to depend on). Marking by port sidesteps needing
+  # to know the actual resolver IPs at all, and re-uses SPLIT_FWD_TABLE
+  # (already pointed at the VPN backend) rather than a third table.
+  for proto in udp tcp; do
+    iptables-legacy -t mangle -C OUTPUT -p "$proto" --dport 53 -j MARK --set-mark "$SPLIT_DNS_FWMARK" 2>/dev/null \
+      || iptables-legacy -t mangle -A OUTPUT -p "$proto" --dport 53 -j MARK --set-mark "$SPLIT_DNS_FWMARK"
+  done
+  ip rule show | grep -q "^${SPLIT_DNS_RULE_PRIORITY}:" \
+    || ip rule add fwmark "$SPLIT_DNS_FWMARK" lookup "$SPLIT_FWD_TABLE" priority "$SPLIT_DNS_RULE_PRIORITY"
+
+  echo "split-tunnel active: forwarded exit-node traffic -> $ACTIVE_GW (table $SPLIT_FWD_TABLE), tailscaled's own traffic -> $DIRECT_GW (table $SPLIT_DIRECT_TABLE)"
+}
+
 do_tailscale_up
+setup_split_tunnel
 
 choose_cert_files() {
   # Sets CERT_FILE / KEY_FILE to a coherent pair. If a real cert AND a
@@ -209,13 +355,19 @@ while true; do
   sleep 10
   date
 
-  pidof tailscaled >/dev/null || tailscaled &
+  pidof tailscaled >/dev/null || tailscaled --port "$TAILSCALE_PORT" &
 
   # Re-assert the default route in case it went missing. Read the state file
   # so a runtime gateway switch (via gateway_api.py) is honoured here too.
   ACTIVE_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
   ip route show default | grep -q "via $ACTIVE_GW" \
     || ip route replace default via "$ACTIVE_GW" dev eth0
+
+  # Keep the forwarded-exit-node-traffic table pointed at whichever VPN
+  # backend is currently active (see setup_split_tunnel / sync_split_fwd_table
+  # above) — a runtime backend switch via the control panel needs this to
+  # follow along the same way the main default route above does.
+  sync_split_fwd_table
 
   # Re-assert IPv6 default route if one was established via the gateway API.
   if [ -f "$ACTIVE_GW_FILE_V6" ]; then

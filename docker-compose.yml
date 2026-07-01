@@ -33,6 +33,13 @@ services:
       - IP_NORDVPN=${IP_NORDVPN}
       - IP_PANEL=${IP_PANEL}
       - INSTANCE_NAME=${INSTANCE_NAME}
+      - TAILSCALE_PORT=${TAILSCALE_PORT:-41641}
+    # Publish the fixed WireGuard/magicsock port (see TAILSCALE_PORT in
+    # tailscale_up.sh) so peers can open a direct UDP connection to this
+    # node instead of every connection being forced onto DERP/peer-relay.
+    # Change TAILSCALE_PORT in .env if this host port is already taken.
+    ports:
+      - "${TAILSCALE_PORT:-41641}:${TAILSCALE_PORT:-41641}/udp"
     cap_add:
       - net_admin
       - sys_module
