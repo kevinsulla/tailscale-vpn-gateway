@@ -20,6 +20,7 @@ RUN apk add --no-cache \
     conntrack-tools \
     prometheus-node-exporter \
     nginx \
+    jq \
  && rm -f /etc/nginx/http.d/default.conf
 
 COPY tailscale_up.sh /tailscale_up.sh
