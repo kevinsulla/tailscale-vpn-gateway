@@ -65,11 +65,32 @@ if [ -n "$CURRENT_DEFAULT_GW" ]; then
 fi
 DIRECT_GW=$(cat "$DIRECT_GW_FILE" 2>/dev/null || echo "")
 
+# Read this here (rather than down by the rest of the split-tunnel config)
+# because it decides what the *main* routing table's default gateway
+# should be, set up next. See the SPLIT_CONTROL_TRAFFIC comment below for
+# the full why; the short version is in the MAIN_GW comment right here.
+SPLIT_CONTROL_TRAFFIC=${SPLIT_CONTROL_TRAFFIC:-true}
+
 # Restore saved gateway (falls back to NordVPN if no state saved yet).
 SAVED_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
 echo "$SAVED_GW" > "$ACTIVE_GW_FILE"
+
+# The *main* table's default gateway matters even though it isn't set to
+# the VPN backend when split-tunnel is on. tailscaled fwmarks its own
+# outbound sockets (0x80000/0xff0000) and adds its own `ip rule` at
+# priority 5210 sending that traffic to `lookup main` — evaluated well
+# before the SPLIT_DIRECT_TABLE rule setup_split_tunnel adds at priority
+# 32760. So tailscaled's own control-plane/DERP traffic actually follows
+# *main*'s default, not the split-direct table; pointing main at the VPN
+# backend here would silently defeat the whole split-tunnel point. Point
+# it at DIRECT_GW instead whenever split-tunnel is enabled and available.
+if [ "$SPLIT_CONTROL_TRAFFIC" = "true" ] && [ -n "$DIRECT_GW" ]; then
+  MAIN_GW="$DIRECT_GW"
+else
+  MAIN_GW="$SAVED_GW"
+fi
 ip route del default 2>/dev/null || true
-ip route add default via "$SAVED_GW" dev eth0
+ip route add default via "$MAIN_GW" dev eth0
 
 # Restore saved IPv6 gateway if one was previously configured.
 SAVED_GW_V6=$(cat "$ACTIVE_GW_FILE_V6" 2>/dev/null || echo "")
@@ -108,8 +129,8 @@ EGRESS_CHECK_TIMEOUT="${EGRESS_CHECK_TIMEOUT:-4}"
 # unaffected either way — it still always goes through the VPN backend.
 # Set to "false" to keep tailscaled's own traffic behind the VPN backend
 # too (e.g. if hiding this node's own metadata traffic matters more to you
-# than resilience).
-SPLIT_CONTROL_TRAFFIC=${SPLIT_CONTROL_TRAFFIC:-true}
+# than resilience). Read earlier (see MAIN_GW above) since the main
+# routing table's default gateway depends on it too.
 # Routing table IDs and ip-rule priorities for the split. Defaults are
 # arbitrary but chosen to avoid colliding with tailscaled's own internal
 # policy routing (it uses table 52 and priorities 5210-5270 for its own
@@ -215,7 +236,14 @@ setup_split_tunnel() {
   #     connection, DERP, log uploads, plus any other local process in
   #     this container) falls through to table SPLIT_DIRECT_TABLE, which
   #     routes via docker's own bridge gateway — bypassing the VPN backend
-  #     entirely.
+  #     entirely. In practice this table is a backstop, not the primary
+  #     mechanism: tailscaled's own fwmark rule (priority 5210, "lookup
+  #     main") matches its own sockets FIRST — before this rule at 32760
+  #     is ever reached — so what actually determines where tailscaled's
+  #     own traffic goes is the *main* table's default gateway. That's why
+  #     MAIN_GW at the top of this script points main at DIRECT_GW whenever
+  #     split-tunnel is on, rather than leaving main pointed at the VPN
+  #     backend the way it was before split-tunnel existed.
   #
   # Both rules are inserted well before the pre-existing 32766/32767
   # main/default fallback rules, and the forwarded-traffic rule is
@@ -359,9 +387,17 @@ while true; do
 
   # Re-assert the default route in case it went missing. Read the state file
   # so a runtime gateway switch (via gateway_api.py) is honoured here too.
+  # Mirrors the MAIN_GW logic at startup: when split-tunnel is on, main's
+  # default must stay DIRECT_GW (tailscaled's own fwmarked traffic follows
+  # it — see the startup comment), not the VPN backend.
   ACTIVE_GW=$(cat "$ACTIVE_GW_FILE" 2>/dev/null || echo "$IP_NORDVPN")
-  ip route show default | grep -q "via $ACTIVE_GW" \
-    || ip route replace default via "$ACTIVE_GW" dev eth0
+  if [ "$SPLIT_CONTROL_TRAFFIC" = "true" ] && [ -n "$DIRECT_GW" ]; then
+    MAIN_GW="$DIRECT_GW"
+  else
+    MAIN_GW="$ACTIVE_GW"
+  fi
+  ip route show default | grep -q "via $MAIN_GW" \
+    || ip route replace default via "$MAIN_GW" dev eth0
 
   # Keep the forwarded-exit-node-traffic table pointed at whichever VPN
   # backend is currently active (see setup_split_tunnel / sync_split_fwd_table
