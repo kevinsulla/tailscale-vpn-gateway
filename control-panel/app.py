@@ -213,4 +213,8 @@ def proxy(name: str, subpath: str):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=80)
+    # threaded=True: the default single-threaded dev server serializes ALL
+    # requests behind whichever one is slowest. Proxy calls to VPN backends
+    # can take up to PROXY_TIMEOUT (60s), which without this would block
+    # every other client (including simple page loads) for the duration.
+    app.run(host="0.0.0.0", port=80, threaded=True)
