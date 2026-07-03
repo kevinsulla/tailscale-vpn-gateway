@@ -75,6 +75,13 @@
                 <button class="btn btn-danger w-100" type="submit" id="disconnectBtn">Disconnect from VPN</button>
             </form>
 
+            <!-- Re-download server configs (shown for backends that support servers/refresh,
+                 independent of credential mode) -->
+            <div id="configRefreshRow" class="d-none mt-2 text-end">
+                <button type="button" class="btn btn-outline-secondary btn-sm" id="configRefreshBtn"
+                        onclick="refreshServerConfigs()">Refresh configs</button>
+            </div>
+
             <!-- ProtonVPN credential management (hidden for non-ProtonVPN backends) -->
             <div id="credentialSection" class="d-none">
                 <hr class="my-3">
@@ -91,8 +98,6 @@
                         <span id="credBadge" class="badge bg-secondary">—</span>
                         <button type="button" class="btn btn-outline-secondary btn-sm"
                                 onclick="showLoginModal()">Re-authenticate</button>
-                        <button type="button" class="btn btn-outline-secondary btn-sm" id="configRefreshBtn"
-                                onclick="refreshServerConfigs()">Refresh configs</button>
                     </div>
                 </div>
             </div>
@@ -547,6 +552,23 @@
             });
     }
 
+    // Show the "Refresh configs" control only for backends that expose
+    // servers/refresh (ProtonVPN). Gated on the capability itself, NOT on
+    // credential state — portal-key mode has no cert panel but still refreshes.
+    function updateConfigRefreshCapability() {
+        const callerBackend = currentBackend;
+        const row = document.getElementById('configRefreshRow');
+        timedFetch(backendApi('servers/refresh/status'), {}, 8000)
+            .then(r => {
+                if (callerBackend !== currentBackend) return;
+                row.classList.toggle('d-none', !r.ok);
+            })
+            .catch(() => {
+                if (callerBackend !== currentBackend) return;
+                row.classList.add('d-none');
+            });
+    }
+
     // --- Credential management (ProtonVPN only) ---
 
     function updateCredentialStatus() {
@@ -617,6 +639,7 @@
         document.getElementById('statusText').textContent = 'Status: …';
         document.getElementById('credentialSection').classList.add('d-none');
         document.getElementById('credBanner').classList.add('d-none');
+        document.getElementById('configRefreshRow').classList.add('d-none');
         _loginModalAutoShown = false;
         updateConnectButton();
         updateActiveBtn();
@@ -624,6 +647,7 @@
         loadCountries();
         loadServers();
         updateCredentialStatus();
+        updateConfigRefreshCapability();
     }
 
     document.addEventListener('DOMContentLoaded', () => {
