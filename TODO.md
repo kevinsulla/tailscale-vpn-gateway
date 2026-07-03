@@ -2,6 +2,13 @@
 
 ## Control Panel: ProtonVPN credential management
 
+> **Note:** This whole section applies only to the **legacy local-agent
+> certificate flow**. Setting `PROTONVPN_WG_PRIVATE_KEY` in `.env` (a
+> portal-registered key) skips the certificate flow entirely — no
+> `credentials.json`, no cert refresh, no expiry to manage — which is now the
+> recommended setup (see README → "ProtonVPN first-time setup"). The items
+> below are only relevant if you deliberately use the cert flow instead.
+
 **Context:** `proton_auth/credentials.json` must be bootstrapped by running
 `extract_credentials.py` on the host whenever the refresh token expires. This
 is a manual step that requires host access and knowledge of the script.

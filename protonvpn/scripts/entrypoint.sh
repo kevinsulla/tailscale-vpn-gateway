@@ -1,6 +1,22 @@
 #!/bin/sh
 set -e
 
+# Bridge the .env variable to WG_PRIVATE_KEY, which download_wg_configs.py reads.
+WG_PRIVATE_KEY="${WG_PRIVATE_KEY:-$PROTONVPN_WG_PRIVATE_KEY}"
+export WG_PRIVATE_KEY
+
+# If a portal-registered private key is supplied, stamp it into every generated
+# config's PrivateKey line. Portal keys are pre-authorized on the account, so
+# the tunnel forwards with no local agent / certificate flow (see USE_LOCAL_AGENT
+# in app.py) — plain WireGuard, like the NordVPN backend. Only the PrivateKey
+# line changes; server public keys and endpoints are untouched. Uses '|' as the
+# sed delimiter since base64 keys contain '/' and '+' but never '|'.
+if [ -n "$WG_PRIVATE_KEY" ]; then
+    echo "PROTONVPN_WG_PRIVATE_KEY set — applying portal key to all WireGuard configs"
+    find /etc/wireguard -name "*.conf" -exec \
+        sed -i "s|^PrivateKey = .*|PrivateKey = $WG_PRIVATE_KEY|" {} +
+fi
+
 if [ -z "$WG_CONF" ] || [ ! -f "$WG_CONF" ]; then
     WG_CONF=$(find /etc/wireguard -name "*.conf" | sort | head -1)
     if [ -z "$WG_CONF" ]; then

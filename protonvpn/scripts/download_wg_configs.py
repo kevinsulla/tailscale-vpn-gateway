@@ -508,6 +508,46 @@ def write_index(out_dir: Path, entries: list[dict], timestamp: str) -> None:
     print(f"  wrote  {out_dir / 'index.json'}  ({len(entries)} entries)")
 
 
+def prune_stale_configs(out_dir: Path, keep_paths: set, args) -> None:
+    """Delete .conf files under out_dir that are not in keep_paths.
+
+    keep_paths is the set of resolved config paths valid for the current server
+    list, so anything else is a server ProtonVPN has removed. index.json and any
+    non-.conf files are never touched. Honours --dry-run.
+
+    NB: with server filters active (--country/--city/--tier/...), keep_paths only
+    covers the filtered subset, so pruning would delete everything outside the
+    filter — warn, since --prune is meant for a full (unfiltered) sync.
+    """
+    if any([args.country, args.city, args.tier, args.max_tier,
+            args.feature, args.max_load, args.top]):
+        print("WARNING: --prune with filters active — this removes every config "
+              "OUTSIDE the filter, not just removed servers. Run unfiltered for a "
+              "true sync.")
+
+    removed = 0
+    for conf in sorted(out_dir.rglob("*.conf")):
+        if conf.resolve() in keep_paths:
+            continue
+        if args.dry_run:
+            print(f"[dry-run] would prune  {conf}")
+        else:
+            conf.unlink()
+            print(f"  pruned  {conf}")
+        removed += 1
+
+    if not args.dry_run:
+        # Drop now-empty city/country dirs, deepest first (rmdir only clears empties).
+        for d in sorted((p for p in out_dir.rglob("*") if p.is_dir()),
+                        key=lambda p: len(p.parts), reverse=True):
+            try:
+                d.rmdir()
+            except OSError:
+                pass  # not empty — leave it
+
+    print(f"{'Would prune' if args.dry_run else 'Pruned'} {removed} stale config(s)")
+
+
 # ---------------------------------------------------------------------------
 # Listing
 # ---------------------------------------------------------------------------
@@ -594,6 +634,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="List matching servers and exit without writing any files")
     out.add_argument("--dry-run", "-n", action="store_true",
         help="Print what would be written without actually writing")
+    out.add_argument("--prune", action="store_true",
+        help="Delete .conf files under --output-dir that are no longer in the "
+             "freshly generated set (i.e. servers ProtonVPN has removed), then "
+             "remove any now-empty city/country directories. index.json and "
+             "other non-.conf files are left untouched. Respects --dry-run.")
 
     return p
 
@@ -671,6 +716,7 @@ def main() -> None:
     timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
     index_entries: list[dict] = []
+    written_paths: set = set()   # abs paths of configs valid this run (for --prune)
     generated = skipped = 0
 
     for logical in matched:
@@ -685,6 +731,7 @@ def main() -> None:
             label    = logical["Name"] if len(physicals) == 1 else f"{logical['Name']}-{idx}"
             rel_path = conf_path(logical, label)
             abs_path = out_dir / rel_path
+            written_paths.add(abs_path.resolve())
 
             feat_list = [k for k, v in FEATURES.items() if logical.get("Features", 0) & v]
             index_entries.append({
@@ -719,6 +766,9 @@ def main() -> None:
 
     if not args.dry_run and index_entries:
         write_index(out_dir, index_entries, timestamp)
+
+    if args.prune and written_paths:
+        prune_stale_configs(out_dir, written_paths, args)
 
     action = "Would generate" if args.dry_run else "Generated"
     print(f"\n{action} {generated} config(s) in {out_dir}/")

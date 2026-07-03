@@ -45,6 +45,14 @@ LOCAL_AGENT_PORT = 65432
 LOCAL_AGENT_CERT = WG_DIR / "proton_auth" / "client.pem"
 LOCAL_AGENT_KEY  = WG_DIR / "proton_auth" / "client.key"
 
+# When a portal-registered WireGuard private key is supplied
+# (PROTONVPN_WG_PRIVATE_KEY), the key is pre-authorized on the account, so the
+# server never jails the session and the whole local-agent + certificate flow
+# is unnecessary — it's plain WireGuard, exactly like a manually-downloaded
+# portal config or the NordVPN backend. Skip the agent and cert-refresher in
+# that mode; it's simpler and avoids the cert-fingerprint/renewal machinery.
+USE_LOCAL_AGENT = not os.environ.get("PROTONVPN_WG_PRIVATE_KEY", "").strip()
+
 _CC_TO_NAME: dict[str, str] = {
     "AD": "Andorra", "AE": "United Arab Emirates", "AF": "Afghanistan",
     "AL": "Albania", "AM": "Armenia", "AO": "Angola", "AR": "Argentina",
@@ -122,7 +130,9 @@ class _LocalAgent:
 
     @property
     def state(self) -> str:
-        """Current state: 'connected', 'connecting', or 'disconnected'."""
+        """Current state: 'disabled', 'connected', 'connecting', or 'disconnected'."""
+        if not USE_LOCAL_AGENT:
+            return "disabled"  # portal-key mode — no agent needed
         if self._stop.is_set() or not (self._thread and self._thread.is_alive()):
             return "disconnected"
         return "connected" if self._auth_event.is_set() else "connecting"
@@ -130,13 +140,18 @@ class _LocalAgent:
     def wait_for_auth(self, timeout: float = 75.0) -> bool:
         """Block until the local agent is authenticated, or return True if no cert is needed.
 
-        Returns True on success (authenticated or cert absent), False on timeout.
+        Returns True on success (authenticated, cert absent, or agent disabled),
+        False on timeout.
         """
+        if not USE_LOCAL_AGENT:
+            return True  # portal-key mode — session is pre-authorized, no wait
         if not LOCAL_AGENT_CERT.exists() or not LOCAL_AGENT_KEY.exists():
             return True  # free tier or cert not yet provisioned — no auth required
         return self._auth_event.wait(timeout=timeout)
 
     def start(self) -> None:
+        if not USE_LOCAL_AGENT:
+            return
         if not LOCAL_AGENT_CERT.exists() or not LOCAL_AGENT_KEY.exists():
             return
         self.stop()
@@ -489,6 +504,15 @@ def _iface_to_city_code(iface: str) -> str | None:
     return (_iface_city_map or {}).get(iface)
 
 
+def _iface_to_name(iface: str) -> str | None:
+    """Friendly ProtonVPN server name (e.g. 'US-CA#36') for an interface stem,
+    looked up from index.json; None if the server isn't in the manifest."""
+    for s in _load_index():
+        if s.get("path") and Path(s["path"]).stem == iface:
+            return s.get("name")
+    return None
+
+
 def _find_conf(stem: str) -> Path | None:
     """Locate a .conf file by its interface name (stem), checking root then subdirs."""
     p = WG_DIR / f"{stem}.conf"
@@ -823,6 +847,11 @@ def status():
     connected = _is_connected(raw)
     fields = _status_fields(raw, iface) if connected else {"Technology": "WireGuard", "Interface": iface}
 
+    # Surface the friendly ProtonVPN server name (e.g. "US-CA#36") for the UI,
+    # falling back to the interface stem if the server isn't in index.json.
+    server_name = _iface_to_name(iface) or iface
+    fields["Server"] = server_name
+
     if connected and _connect_time > 0:
         fields["Uptime"] = _uptime_str(_connect_time)
 
@@ -852,8 +881,9 @@ def status():
     return jsonify({
         "status": "Connected" if connected else "Disconnected",
         "server": iface,
+        "server_name": server_name,
         "city_code": city_code,
-        "city": f"ProtonVPN ({iface})",
+        "city": f"ProtonVPN ({server_name})",
         "fields": fields,
         "details": raw,
         "local_agent": _local_agent.state,
@@ -889,6 +919,13 @@ def _connect_to_target(target: str, exclude: set[str] | None = None) -> tuple[st
         ]
         if not candidates:
             return None, "", f"No servers found for {country}/{city}"
+        # Deprioritize free-tier servers to lowest priority: they're shared across
+        # every free account regardless of what this (paid) account is entitled
+        # to, so they run hot and unreliable. Prefer paid servers everywhere and
+        # only fall back to free if a location genuinely has nothing else.
+        paid_candidates = [s for s in candidates if s.get("tier") != "free"]
+        if paid_candidates:
+            candidates = paid_candidates
         # Prefer IPv6-capable servers: the WireGuard tunnel address (2a07:b944::2:2/128)
         # only works if the server has the ipv6 feature; non-IPv6 servers drop IPv6 packets.
         ipv6_candidates = [s for s in candidates if "ipv6" in s.get("features", [])]
@@ -1346,6 +1383,12 @@ def public_ip():
 @app.route("/api/v1/proton/credential-status")
 def credential_status():
     """Report the health of credentials.json and client.pem."""
+    if not USE_LOCAL_AGENT:
+        # Portal-key mode: no certificate or login to manage. Return 404 so the
+        # control panel hides the credential section entirely instead of showing
+        # a (meaningless) cert-expiry warning and prompting for a ProtonVPN login.
+        return jsonify({"status": "disabled",
+                        "message": "Portal key mode — no certificate needed"}), 404
     creds = _cert_refresher._load_creds()
     remaining = _cert_refresher._cert_seconds_remaining()
 
@@ -1553,7 +1596,11 @@ def _save_login_creds(auth: dict) -> None:
 
 
 if __name__ == "__main__":
-    _cert_refresher.start()
+    if USE_LOCAL_AGENT:
+        _cert_refresher.start()
+    else:
+        logger.info("PROTONVPN_WG_PRIVATE_KEY set — using pre-authorized portal "
+                    "key; local agent and certificate refresh are disabled.")
     _ip_poller.start()
     # Start the local agent at launch if the tunnel is already up (entrypoint.sh
     # brings up wg-quick before starting this process).  Without this, the agent

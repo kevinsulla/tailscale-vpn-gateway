@@ -171,6 +171,12 @@ services:
       - INSTANCE_NAME=${INSTANCE_NAME}
       - WG_CONF=${PROTONVPN_WG_CONF:-/etc/wireguard/US/San_Jose/us-ca_10.conf}
       - PROTONVPN_CITY=${PROTONVPN_CITY:-}
+      # Portal-registered WireGuard private key (from account.proton.me ->
+      # Downloads -> WireGuard). When set, the tunnel uses this pre-authorized
+      # key directly and the local-agent/certificate flow is skipped entirely
+      # (plain WireGuard, like the NordVPN backend). Leave empty to use the
+      # legacy local-agent cert flow instead.
+      - PROTONVPN_WG_PRIVATE_KEY=${PROTONVPN_WG_PRIVATE_KEY:-}
     volumes:
       - "/dev/net/tun:/dev/net/tun"
       - "/lib/modules:/lib/modules:ro"

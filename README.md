@@ -77,6 +77,7 @@ expected; see *TLS* below).
 | `IP_VPN_V6`                    | ProtonVPN container's static IPv6 address within `IP_SUBNET_V6` (e.g. `fd00:cafe:1::10`). |
 | `PROTONVPN_WG_CONF`            | Path inside the container to the WireGuard config to use on startup. Defaults to `US/San_Jose/us-ca_10.conf` if unset. |
 | `PROTONVPN_CITY`               | Default city to connect to on startup, e.g. `US/San_Jose`. Uses `Country/City_Name` format (underscores for spaces), matching the wireguard directory layout. Persisted across restarts — once set, the container reconnects to the last-used city regardless of `WG_CONF`. |
+| `PROTONVPN_WG_PRIVATE_KEY`     | Portal-registered WireGuard private key (from `account.proton.me → Downloads → WireGuard`). When set, the container stamps this key into every config on startup and uses **plain pre-authorized WireGuard** — the local-agent certificate flow is skipped entirely (no cert expiry/renewal to manage), just like the NordVPN backend. Leave unset to use the legacy local-agent cert flow. **Recommended.** |
 
 ### `control-panel/config/backends.json`
 
@@ -163,6 +164,22 @@ docker compose up -d --build protonvpn
 
 The default `WG_CONF` is `US/San_Jose/us-ca_10.conf`. Override it with
 `PROTONVPN_WG_CONF` in `.env` to pick a different server on startup.
+
+#### Recommended: skip the certificate flow with `PROTONVPN_WG_PRIVATE_KEY`
+
+Portal-registered keys are pre-authorized on your account, so the WireGuard
+tunnel forwards **without** ProtonVPN's local-agent certificate exchange. Set
+`PROTONVPN_WG_PRIVATE_KEY` in `.env` to the portal `PrivateKey` from Step 1:
+
+```sh
+PROTONVPN_WG_PRIVATE_KEY=your-portal-wireguard-private-key
+```
+
+The container then stamps this key into every config on startup and runs plain
+pre-authorized WireGuard — exactly like the NordVPN backend, with **no cert
+expiry, renewal, or login flow to manage**. This is the simplest and most
+robust setup. (Leaving it unset falls back to the legacy local-agent cert flow,
+which requires `proton_auth/credentials.json` and periodic cert refresh.)
 
 ### Transferring configs to another host
 
