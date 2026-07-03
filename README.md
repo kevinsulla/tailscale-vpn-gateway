@@ -119,6 +119,16 @@ Download any single WireGuard config from the ProtonVPN portal
 generates and registers the key pair automatically. Copy the `PrivateKey`
 line from the downloaded file — the same key works for every server.
 
+> **⚠️ Use a unique key per host.** ProtonVPN's backend permits only **one live
+> WireGuard session per key** and kills duplicates. If two machines running this
+> stack (e.g. a home gateway and a travel router) connect with the *same* key at
+> once, Proton keeps tearing one session down and WireGuard has to re-handshake —
+> which manifests as severe, intermittent packet loss on **both**. Generate a
+> **separate** WireGuard config (its own key) in the portal for **each** host.
+> (The same mechanism means rapid server-switching can briefly self-collide: the
+> old same-key session lingers on Proton's side while the new one comes up — so
+> prefer a pinned server and minimal reconnects for a stable link.)
+
 ### Step 2 — run the downloader
 
 ```sh

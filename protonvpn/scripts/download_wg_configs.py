@@ -44,6 +44,11 @@ Before using this script:
   3. Pass it to this script via --private-key or WG_PRIVATE_KEY.
      The same key works for every server — it is account/device-scoped.
 
+     Use a UNIQUE key per host, though: ProtonVPN allows only one live
+     WireGuard session per key and kills duplicates, so two hosts sharing a
+     key will fight over the session and both see intermittent packet loss.
+     Generate a separate portal config (its own key) for each machine.
+
 Authentication uses your main ProtonVPN account username and password.
 
 Requirements:
