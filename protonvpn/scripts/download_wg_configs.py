@@ -31,6 +31,7 @@ index.json structure:
         "tier":     "plus",
         "load":     23,
         "features": ["p2p"],
+        "host":     "185.159.156.1",
         "path":     "US/New_York/us-plus-1.conf"
       }, ...
     ]
@@ -746,6 +747,8 @@ def main() -> None:
                 "tier":     TIER_NAMES.get(logical.get("Tier", 0), "unknown"),
                 "load":     logical.get("Load"),
                 "features": feat_list,
+                "host":     entry_ip,   # physical endpoint IP; lets the backend dedup
+                                        # the many logical servers that share one box
                 "path":     str(rel_path),
             })
 

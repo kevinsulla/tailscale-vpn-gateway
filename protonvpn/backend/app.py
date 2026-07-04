@@ -522,6 +522,58 @@ def _find_conf(stem: str) -> Path | None:
     return hits[0] if hits else None
 
 
+_endpoint_cache: dict[str, str | None] = {}  # conf path → endpoint host (IP), cached
+
+
+def _conf_endpoint_host(conf: Path | None) -> str | None:
+    """Endpoint host (IP, no port) from a WireGuard .conf, cached by path.
+
+    ProtonVPN fronts many logical servers — distinct names and configs — with a
+    single physical machine that shares one Endpoint IP. Keying on that host lets
+    callers dedup or exclude by the real box rather than the config label, so a
+    "reconnect" reaches a genuinely different server instead of the same one under
+    a new name. Endpoints are static per config; the cache is cleared on refresh.
+    """
+    if conf is None:
+        return None
+    key = str(conf)
+    if key not in _endpoint_cache:
+        host = None
+        try:
+            for line in conf.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("Endpoint"):
+                    _, _, val = stripped.partition("=")
+                    host = val.strip().rsplit(":", 1)[0].strip() or None
+                    break
+        except OSError:
+            host = None
+        _endpoint_cache[key] = host
+    return _endpoint_cache[key]
+
+
+def _server_host(entry: dict) -> str | None:
+    """Endpoint IP for an index.json server entry.
+
+    Prefers the recorded "host" field (written by download_wg_configs.py) so
+    dedup needs no disk reads; falls back to parsing the .conf for indexes
+    generated before that field existed.
+    """
+    host = entry.get("host")
+    if host:
+        return host
+    path = entry.get("path")
+    return _conf_endpoint_host(WG_DIR / path) if path else None
+
+
+def _host_for_iface(stem: str) -> str | None:
+    """Endpoint IP for a WireGuard interface stem, via its index entry or .conf."""
+    for s in _load_index():
+        if s.get("path") and Path(s["path"]).stem == stem:
+            return _server_host(s)
+    return _conf_endpoint_host(_find_conf(stem))
+
+
 def _conf_has_ipv6(conf: Path) -> bool:
     """Return True if the config's Interface Address includes an IPv6 CIDR."""
     try:
@@ -930,11 +982,35 @@ def _connect_to_target(target: str, exclude: set[str] | None = None) -> tuple[st
         # only works if the server has the ipv6 feature; non-IPv6 servers drop IPv6 packets.
         ipv6_candidates = [s for s in candidates if "ipv6" in s.get("features", [])]
         pool = ipv6_candidates if ipv6_candidates else candidates
-        if exclude:
-            filtered = [s for s in pool if Path(s["path"]).stem not in exclude]
-            if filtered:
-                pool = filtered
-            # else: only one server in this city — can't rotate, use it anyway
+        # ProtonVPN maps many logical servers (distinct names/configs) onto a single
+        # physical machine sharing one Endpoint IP. Filter and dedup on that endpoint
+        # rather than the config name: excluding only the current *name* on reconnect
+        # can land straight back on the same box under a different label. Translate
+        # the excluded interfaces to the endpoint IPs we must avoid.
+        exclude_hosts = {
+            h for stem in (exclude or ())
+            if (h := _host_for_iface(stem))
+        }
+        # Keep one representative (lowest load) per distinct endpoint and drop any box
+        # we were told to avoid. Servers whose endpoint can't be resolved are kept
+        # as-is so an unreadable config never silently removes a usable server.
+        rep_by_host: dict[str, dict] = {}
+        unknown: list[dict] = []
+        for s in pool:
+            host = _server_host(s)
+            if host is None:
+                unknown.append(s)
+                continue
+            if host in exclude_hosts:
+                continue
+            cur = rep_by_host.get(host)
+            if cur is None or s.get("load", 100) < cur.get("load", 100):
+                rep_by_host[host] = s
+        deduped = list(rep_by_host.values()) + unknown
+        if deduped:
+            pool = deduped
+        # else: excluding the current box emptied the pool (the city has only that one
+        # machine) — fall back to the original pool so we still reconnect somewhere.
         best = random.choice(pool)
         target = Path(best["path"]).stem
         logger.info("City random-select %s/%s → %s", country, city, target)
@@ -1334,6 +1410,7 @@ def _run_servers_refresh() -> None:
         with _index_lock:
             _index_cache    = None
             _iface_city_map = None
+            _endpoint_cache.clear()
         _load_index()
 
         lines  = [l for l in result.stdout.splitlines() if l.strip()]
