@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: "docker"
+    directory: "/tailscale"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/nordvpn"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/nordvpn-wg"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/protonvpn"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "docker"
+    directory: "/control-panel"
+    schedule:
+      interval: "weekly"
